@@ -40,7 +40,7 @@ local CONFIG = {
 	CameraSensitivity = 1.0, -- 1 = normal Roblox feel. 0.7 = slower, 1.3 = faster
 	CameraSmoothing = 30, -- lower = smoother / floatier, higher = more direct (20-40 is good)
 	JumpMultiplier = 1.2, -- jump strength while wall walking
-	ButtonSize = 62, -- size of the floating spider button (pixels)
+	ButtonSize = 46, -- size of the floating spider button (pixels)
 	DownRays = 16, -- surface detection rays (lower = faster on weak phones, higher = smoother corners)
 	FeelerRays = 8,
 	DefaultZoom = 12.5, -- camera distance if it can't be read from the game's camera
@@ -559,65 +559,241 @@ end
 ------------------------------------------------------------------------------------------------------
 -- ANIMATION + SOUND  (PlatformStand switches the game's own animations off, so we drive them)
 ------------------------------------------------------------------------------------------------------
-local ANIMS = {
-	R15 = { idle = 507766388, run = 507767714, walk = 507777826, jump = 507765000, fall = 507767968 },
-	R6 = { idle = 180435571, run = 180426354, walk = 180426354, jump = 125750702, fall = 180436148 },
+-- Default Roblox animations (only used if the game's Animate script has none)
+local DEFAULT_PACK = {
+	R15 = {
+		idle = { { 507766388, 9 }, { 507766666, 1 }, { 507766951, 1 } },
+		walk = { { 507777826, 1 } },
+		run = { { 507767714, 1 } },
+		jump = { { 507765000, 1 } },
+		fall = { { 507767968, 1 } },
+	},
+	R6 = {
+		idle = { { 180435571, 9 }, { 180435792, 1 } },
+		walk = { { 180426354, 1 } },
+		jump = { { 125750702, 1 } },
+		fall = { { 180436148, 1 } },
+	},
 }
+
+-- Reads YOUR animation pack from the character's Animate script (the same ids the game uses for you)
+local function readPack(character, rig)
+	local pack = {}
+	local animate = character:FindFirstChild("Animate")
+	for _, name in ipairs({ "idle", "walk", "run", "jump", "fall" }) do
+		local list = {}
+		local folder = animate and animate:FindFirstChild(name)
+		if folder then
+			local kids = folder:GetChildren()
+			table.sort(kids, function(x, y)
+				return x.Name < y.Name
+			end)
+			for _, a in ipairs(kids) do
+				if a:IsA("Animation") and a.AnimationId ~= "" then
+					local w = 1
+					local wo = a:FindFirstChild("Weight")
+					if wo and (wo:IsA("NumberValue") or wo:IsA("IntValue")) then
+						w = wo.Value
+					end
+					list[#list + 1] = { a.AnimationId, w }
+				end
+			end
+		end
+		if #list == 0 then
+			list = DEFAULT_PACK[rig][name] or {}
+		end
+		pack[name] = list
+	end
+	return pack
+end
 
 local AnimCtl = {}
 AnimCtl.__index = AnimCtl
 
-function AnimCtl.new(humanoid)
+function AnimCtl.new(humanoid, character)
 	local self = setmetatable({}, AnimCtl)
 	self.rig = (humanoid.RigType == Enum.HumanoidRigType.R6) and "R6" or "R15"
-	self.tracks = {}
-	self.current = nil
-	self.lastSpeed = nil
+	self.state = nil
+	self.dead = false
+	self.lastMove = nil
+	self.idleTrack = nil
+	self.idle = {}
+	self.all = {}
+	self.conns = {}
+
 	local loader = humanoid:FindFirstChildOfClass("Animator") or humanoid
-	for name, id in pairs(ANIMS[self.rig]) do
+	local pack = readPack(character, self.rig)
+
+	local function load(entry, looped)
+		if not entry then
+			return nil
+		end
 		local anim = Instance.new("Animation")
-		anim.AnimationId = "rbxassetid://" .. id
+		anim.AnimationId = (type(entry[1]) == "number") and ("rbxassetid://" .. entry[1]) or entry[1]
 		local ok, track = pcall(function()
 			return loader:LoadAnimation(anim)
 		end)
 		if ok and track then
 			track.Priority = Enum.AnimationPriority.Action
-			track.Looped = (name ~= "jump")
-			self.tracks[name] = track
+			track.Looped = looped
+			self.all[#self.all + 1] = track
+			return track
+		end
+		return nil
+	end
+
+	local multi = #pack.idle > 1
+	for _, e in ipairs(pack.idle) do
+		local t = load(e, not multi)
+		if t then
+			self.idle[#self.idle + 1] = { track = t, weight = e[2] }
+			if multi then
+				-- like the default Animate script: when one idle finishes, pick the next one
+				table.insert(
+					self.conns,
+					t.Ended:Connect(function()
+						if not self.dead and self.state == "idle" and self.idleTrack == t then
+							self:PlayIdle()
+						end
+					end)
+				)
+			end
 		end
 	end
+	self.walk = load(pack.walk[1], true)
+	self.run = (self.rig == "R15") and load(pack.run[1], true) or nil
+	self.jump = load(pack.jump[1], false)
+	self.fall = load(pack.fall[1], true)
 	return self
 end
 
-function AnimCtl:Set(name, speed)
-	local track = self.tracks[name]
-	if not track then
+function AnimCtl:PlayIdle()
+	local set = self.idle
+	if #set == 0 then
 		return
 	end
-	if self.current ~= name then
-		local old = self.tracks[self.current]
-		if old then
-			old:Stop(0.15)
-		end
-		track:Play(0.15)
-		self.current = name
-		self.lastSpeed = nil
+	local total = 0
+	for _, e in ipairs(set) do
+		total = total + e.weight
 	end
-	speed = speed or 1
-	if not self.lastSpeed or math.abs(speed - self.lastSpeed) > 0.03 then
-		track:AdjustSpeed(speed)
-		self.lastSpeed = speed
+	local roll = math.random() * total
+	local pick = set[1]
+	for _, e in ipairs(set) do
+		roll = roll - e.weight
+		if roll <= 0 then
+			pick = e
+			break
+		end
+	end
+	self.idleTrack = pick.track
+	pick.track:Play(0.15)
+end
+
+local function stopTrack(t, fade)
+	if t then
+		t:Stop(fade)
+	end
+end
+
+function AnimCtl:StopState(state)
+	if state == "idle" then
+		for _, e in ipairs(self.idle) do
+			e.track:Stop(0.15)
+		end
+	elseif state == "move" then
+		stopTrack(self.walk, 0.15)
+		stopTrack(self.run, 0.15)
+	elseif state == "jump" then
+		stopTrack(self.jump, 0.1)
+	elseif state == "fall" then
+		stopTrack(self.fall, 0.15)
+	end
+end
+
+function AnimCtl:StartState(state)
+	if state == "idle" then
+		self:PlayIdle()
+	elseif state == "move" then
+		if self.walk then
+			self.walk:Play(0.15)
+		end
+		if self.run then
+			self.run:Play(0.15)
+		end
+	elseif state == "jump" then
+		if self.jump then
+			self.jump:Play(0.1)
+		end
+	elseif state == "fall" then
+		if self.fall then
+			self.fall:Play(0.2)
+		end
+	end
+end
+
+function AnimCtl:UpdateMove(speed)
+	local walk, run = self.walk, self.run
+	if self.rig == "R6" or not (walk and run) then
+		local only = walk or run
+		if only then
+			local sp = (self.rig == "R6") and (speed / 14.5) or (speed / 16 * 1.25)
+			if not self.lastMove or math.abs(sp - self.lastMove) > 0.03 then
+				only:AdjustSpeed(sp)
+				self.lastMove = sp
+			end
+		end
+		return
+	end
+	-- R15: blend your walk and run animations by speed (same way the default Animate script does)
+	local rs = speed / 16 * 1.25
+	if self.lastMove and math.abs(rs - self.lastMove) < 0.02 then
+		return
+	end
+	self.lastMove = rs
+	local eps = 0.0001
+	local ww, rw
+	if rs < 0.33 then
+		ww, rw = 1, eps
+	elseif rs < 0.66 then
+		local w = (rs - 0.33) / 0.33
+		ww, rw = 1 - w + eps, w + eps
+	else
+		ww, rw = eps, 1
+	end
+	walk:AdjustWeight(ww)
+	run:AdjustWeight(rw)
+	walk:AdjustSpeed(rs)
+	run:AdjustSpeed(rs)
+end
+
+function AnimCtl:Set(state, speed)
+	if state ~= self.state then
+		local old = self.state
+		self.state = state
+		self.lastMove = nil
+		if old then
+			self:StopState(old)
+		end
+		self:StartState(state)
+	end
+	if state == "move" then
+		self:UpdateMove(speed or 0)
 	end
 end
 
 function AnimCtl:Destroy()
-	for _, t in pairs(self.tracks) do
+	self.dead = true
+	for _, c in ipairs(self.conns) do
+		c:Disconnect()
+	end
+	self.conns = {}
+	for _, t in ipairs(self.all) do
 		pcall(function()
 			t:Stop(0.1)
 			t:Destroy()
 		end)
 	end
-	self.tracks = {}
+	self.all = {}
 end
 
 local SoundCtl = {}
@@ -775,7 +951,7 @@ function Gravity.new(character, humanoid, hrp, hooks)
 	self.SavedPlatformStand = humanoid.PlatformStand
 	humanoid.PlatformStand = true
 
-	self.Anim = AnimCtl.new(humanoid)
+	self.Anim = AnimCtl.new(humanoid, character)
 	self.Sound = SoundCtl.new(hrp)
 
 	pcall(function()
@@ -1000,25 +1176,18 @@ function Gravity:Step(dt)
 	self.VForce.Force = walkForce + gForce
 	self.Align.CFrame = charRot
 
-	-- 6. animation + sound
-	local name, speed = "idle", 1
+	-- 6. animation (your animation pack) + sound
+	local state = "idle"
 	if grounded then
 		if moving then
-			local sp = hVel.Magnitude
-			if self.Anim.rig == "R6" then
-				name, speed = "walk", sp / 14.5
-			elseif sp < 9 then
-				name, speed = "walk", sp / 10
-			else
-				name, speed = "run", sp / 16 * 1.25
-			end
+			state = "move"
 		end
 	elseif self.Jumped and upVel > 0 then
-		name = "jump"
+		state = "jump"
 	else
-		name = "fall"
+		state = "fall"
 	end
-	self.Anim:Set(name, speed)
+	self.Anim:Set(state, hVel.Magnitude)
 	self.Sound:SetRunning(grounded and moving and hVel.Magnitude > 2)
 end
 
@@ -1070,7 +1239,7 @@ function Gravity:Destroy()
 end
 
 ------------------------------------------------------------------------------------------------------
--- SPIDER BUTTON  (web + crawling mini webs + legs that grow when ON)
+-- SPIDER BUTTON  (web + spiders running around it + legs that grow when ON)
 ------------------------------------------------------------------------------------------------------
 local COLOR_OFF = Color3.fromRGB(150, 160, 185)
 local COLOR_ON = Color3.fromRGB(255, 64, 98)
@@ -1148,6 +1317,71 @@ local function addCorner(inst, scale)
 	return c
 end
 
+-- tiny spider: drawn facing UP inside its own square, the square is rotated to face where it runs.
+-- leg = { angle of upper leg (deg, 0 = right, -90 = up), bend of lower leg }
+local SPIDER_LEGS = { { -58, 32 }, { -20, 30 }, { 18, 28 }, { 54, 30 } }
+
+local function buildSpider(parent, m, out)
+	local u = m / 18
+	local spider = { u = u, legs = {} }
+	for side = 1, 2 do
+		for j = 1, 4 do
+			local def = SPIDER_LEGS[j]
+			local leg = { base = def[1], bend = def[2], mirror = 1 }
+			if side == 2 then
+				leg.base, leg.bend, leg.mirror = 180 - def[1], -def[2], -1
+			end
+			-- alternating gait: legs 1+3 on one side move with legs 2+4 on the other
+			leg.phase = ((side == 1) == (j % 2 == 1)) and 0 or math.pi
+			for _, key in ipairs({ "a", "b" }) do
+				local f = Instance.new("Frame")
+				f.AnchorPoint = Vector2.new(0.5, 0.5)
+				f.BorderSizePixel = 0
+				f.BackgroundColor3 = COLOR_OFF
+				f.ZIndex = 6
+				f.Size = UDim2.fromOffset(2, 1)
+				f.Parent = parent
+				out[#out + 1] = f
+				leg[key] = f
+			end
+			spider.legs[#spider.legs + 1] = leg
+		end
+	end
+	local function blob(cx, cy, w, h)
+		local f = Instance.new("Frame")
+		f.AnchorPoint = Vector2.new(0.5, 0.5)
+		f.Position = UDim2.fromOffset(cx * u, cy * u)
+		f.Size = UDim2.fromOffset(w * u, h * u)
+		f.BackgroundColor3 = COLOR_OFF
+		f.BorderSizePixel = 0
+		f.ZIndex = 6
+		addCorner(f, 0.5)
+		f.Parent = parent
+		out[#out + 1] = f
+	end
+	blob(9, 11.4, 5.4, 6.6) -- abdomen
+	blob(9, 7.0, 3.8, 4.2) -- head
+	return spider
+end
+
+local function poseSpider(spider, step, amp)
+	local u = spider.u
+	local ax, ay = 9 * u, 7.6 * u
+	local th = math.max(1, 1.1 * u)
+	for _, leg in ipairs(spider.legs) do
+		local ph = step + leg.phase
+		local a1 = math.rad(leg.base + leg.mirror * math.sin(ph) * amp)
+		local a2 = a1 + math.rad(leg.bend)
+		local lift = 1 - 0.18 * math.max(0, math.cos(ph))
+		local kx = ax + math.cos(a1) * 3.4 * u * lift
+		local ky = ay + math.sin(a1) * 3.4 * u * lift
+		local tx = kx + math.cos(a2) * 4.0 * u * lift
+		local ty = ky + math.sin(a2) * 4.0 * u * lift
+		placeSegment(leg.a, th, ax, ay, kx, ky)
+		placeSegment(leg.b, th, kx, ky, tx, ty)
+	end
+end
+
 local UI = {}
 UI.__index = UI
 
@@ -1155,13 +1389,18 @@ function UI.new(onToggle)
 	local self = setmetatable({}, UI)
 	local SIZE = CONFIG.ButtonSize
 	local HALF = SIZE / 2
-	self.size, self.half = SIZE, HALF
+	local scale = SIZE / 62
+	self.size, self.half, self.scale = SIZE, HALF, scale
 	self.conns = {}
 	self.t = 0
 	self.blend, self.target = 0, 0
 	self.grow, self.legTarget = 0, 0
 	self.legsShown = false
-	self.webLines, self.crawlLines, self.legStrokes = {}, {}, {}
+	self.legClock = 0
+	self.dragging = false
+	self.scaleTarget = 1
+	self.pos, self.targetPos = nil, nil
+	self.webLines, self.spiderParts, self.legStrokes = {}, {}, {}
 
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "SpiderWallWalkUI"
@@ -1175,10 +1414,14 @@ function UI.new(onToggle)
 	holder.Name = "Holder"
 	holder.AnchorPoint = Vector2.new(0.5, 0.5)
 	holder.Size = UDim2.fromOffset(SIZE, SIZE)
-	holder.Position = UDim2.new(1, -90, 0.36, 0)
+	holder.Position = UDim2.new(1, -70, 0.36, 0)
 	holder.BackgroundTransparency = 1
 	holder.Parent = gui
 	self.holder = holder
+
+	local uiScale = Instance.new("UIScale") -- gentle "lift" while you drag it
+	uiScale.Parent = holder
+	self.uiScale = uiScale
 
 	-- legs (behind the body)
 	local legsFrame = Instance.new("Frame")
@@ -1194,7 +1437,6 @@ function UI.new(onToggle)
 		{ 12, 42, 2 },
 		{ 38, 78, 30 },
 	}
-	local scale = SIZE / 62
 	self.legs = {}
 	for i = 1, 8 do
 		local d = defs[(i + 1) // 2]
@@ -1203,9 +1445,6 @@ function UI.new(onToggle)
 			root, femur, tibia = 180 - root, 180 - femur, 180 - tibia
 		end
 		local rel = math.rad(tibia - femur)
-		if i % 2 == 0 then
-			rel = math.rad((180 - tibia) - (180 - femur))
-		end
 		local leg = {
 			root = math.rad(root),
 			femur = math.rad(femur),
@@ -1215,6 +1454,8 @@ function UI.new(onToggle)
 			phase = i * 0.93,
 			l1 = 15 * scale,
 			l2 = 20 * scale,
+			th1 = 4 * scale,
+			th2 = 3 * scale,
 		}
 		for _, which in ipairs({ "seg1", "seg2" }) do
 			local seg = Instance.new("Frame")
@@ -1234,7 +1475,6 @@ function UI.new(onToggle)
 			seg.Parent = legsFrame
 			leg[which] = seg
 		end
-		leg.th1, leg.th2 = 4 * scale, 3 * scale
 		self.legs[i] = leg
 	end
 
@@ -1251,7 +1491,7 @@ function UI.new(onToggle)
 	grad.Rotation = 90
 	grad.Parent = body
 	local stroke = Instance.new("UIStroke")
-	stroke.Thickness = 2
+	stroke.Thickness = math.max(1.5, 2 * scale)
 	stroke.Color = COLOR_OFF
 	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	stroke.Parent = body
@@ -1268,12 +1508,13 @@ function UI.new(onToggle)
 	web.ZIndex = 4
 	web.Parent = holder
 	self.web = web
-	buildWeb(web, HALF, HALF, HALF - 5, {
+	local small = SIZE < 54
+	buildWeb(web, HALF, HALF, HALF - 4, {
 		lines = 4,
 		sides = 8,
-		rings = { 0.26, 0.5, 0.75, 1.0 },
+		rings = small and { 0.34, 0.64, 1.0 } or { 0.26, 0.5, 0.75, 1.0 },
 		sag = 0.88,
-		th = 1.6,
+		th = small and 1.2 or 1.6,
 		color = COLOR_OFF,
 		z = 4,
 	}, self.webLines)
@@ -1282,7 +1523,7 @@ function UI.new(onToggle)
 	core.Name = "Core"
 	core.AnchorPoint = Vector2.new(0.5, 0.5)
 	core.Position = UDim2.fromScale(0.5, 0.5)
-	core.Size = UDim2.fromOffset(7 * scale, 7 * scale)
+	core.Size = UDim2.fromOffset(math.max(4, 7 * scale), math.max(4, 7 * scale))
 	core.BackgroundColor3 = COLOR_OFF
 	core.BorderSizePixel = 0
 	core.ZIndex = 5
@@ -1290,54 +1531,48 @@ function UI.new(onToggle)
 	core.Parent = holder
 	self.core = core
 
-	-- little webs crawling around the rim
-	self.crawlers = {}
-	local cdefs = {
+	-- little spiders running around the rim of the web
+	self.spiders = {}
+	local sdefs = {
 		{ angle = 0.5, dir = 1, speed = 1.15, rate = 2.1, phase = 0.0 },
 		{ angle = 2.6, dir = -1, speed = 0.95, rate = 1.7, phase = 1.9 },
 		{ angle = 4.6, dir = 1, speed = 1.35, rate = 2.6, phase = 3.7 },
 	}
-	for _, c in ipairs(cdefs) do
-		local m = 16 * scale
+	for _, c in ipairs(sdefs) do
+		local m = 22 * scale
 		local f = Instance.new("Frame")
-		f.Name = "CrawlerWeb"
+		f.Name = "RunningSpider"
 		f.AnchorPoint = Vector2.new(0.5, 0.5)
 		f.Size = UDim2.fromOffset(m, m)
 		f.BackgroundTransparency = 1
 		f.ZIndex = 6
 		f.Parent = holder
-		buildWeb(f, m / 2, m / 2, m / 2 - 1, {
-			lines = 3,
-			sides = 6,
-			rings = { 0.55, 1.0 },
-			sag = 1,
-			th = 1,
-			color = COLOR_OFF,
-			z = 6,
-		}, self.crawlLines)
+		c.spider = buildSpider(f, m, self.spiderParts)
+		c.step = c.phase
 		c.frame = f
-		self.crawlers[#self.crawlers + 1] = c
+		poseSpider(c.spider, c.step, 18)
+		self.spiders[#self.spiders + 1] = c
 	end
 
-	-- tap / drag
+	-- tap / drag (hit area is a little bigger than the button so it is easy to press)
 	local hit = Instance.new("TextButton")
 	hit.Name = "Hit"
+	hit.AnchorPoint = Vector2.new(0.5, 0.5)
+	hit.Position = UDim2.fromScale(0.5, 0.5)
+	hit.Size = UDim2.new(1, 12, 1, 12)
 	hit.BackgroundTransparency = 1
 	hit.Text = ""
 	hit.AutoButtonColor = false
-	hit.Size = UDim2.fromScale(1, 1)
 	hit.ZIndex = 10
 	hit.Parent = holder
 	addCorner(hit, 0.5)
 
-	local dragInput, dragStart, startCenter, dragMoved
+	local dragInput, dragStart, anchorPos, dragMoved
 	hit.InputBegan:Connect(function(input)
 		local t = input.UserInputType
 		if t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1 then
 			dragInput = input
 			dragStart = Vector2.new(input.Position.X, input.Position.Y)
-			local ap = holder.AbsolutePosition
-			startCenter = Vector2.new(ap.X + HALF, ap.Y + HALF)
 			dragMoved = false
 		end
 	end)
@@ -1355,16 +1590,22 @@ function UI.new(onToggle)
 			if not isDrag then
 				return
 			end
-			local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
-			if not dragMoved and delta.Magnitude > 10 then
+			local cur = Vector2.new(input.Position.X, input.Position.Y)
+			if not dragMoved and (cur - dragStart).Magnitude > 8 then
 				dragMoved = true
+				local ap, as = holder.AbsolutePosition, holder.AbsoluteSize
+				anchorPos = Vector2.new(ap.X + as.X / 2, ap.Y + as.Y / 2)
+				self.pos = anchorPos
+				self.targetPos = anchorPos
+				self.dragging = true
+				self.scaleTarget = 1.12
 			end
 			if dragMoved then
 				local cam = Workspace.CurrentCamera
 				local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-				local p = startCenter + delta
+				local p = anchorPos + (cur - dragStart)
 				local m = HALF + 6
-				holder.Position = UDim2.fromOffset(clamp(p.X, m, vp.X - m), clamp(p.Y, m, vp.Y - m))
+				self.targetPos = Vector2.new(clamp(p.X, m, vp.X - m), clamp(p.Y, m, vp.Y - m))
 			end
 		end)
 	)
@@ -1373,7 +1614,10 @@ function UI.new(onToggle)
 		UserInputService.InputEnded:Connect(function(input)
 			if input == dragInput then
 				dragInput = nil
-				if not dragMoved then
+				if dragMoved then
+					self.dragging = false
+					self.scaleTarget = 1
+				else
 					onToggle()
 				end
 			end
@@ -1417,7 +1661,7 @@ function UI:ApplyColor()
 	for _, f in ipairs(self.webLines) do
 		f.BackgroundColor3 = c
 	end
-	for _, f in ipairs(self.crawlLines) do
+	for _, f in ipairs(self.spiderParts) do
 		f.BackgroundColor3 = c
 	end
 	for _, s in ipairs(self.legStrokes) do
@@ -1435,7 +1679,7 @@ function UI:Pulse()
 	ring.ZIndex = 2
 	addCorner(ring, 0.5)
 	local st = Instance.new("UIStroke")
-	st.Thickness = 3
+	st.Thickness = 2
 	st.Color = (self.target > 0) and COLOR_ON or COLOR_OFF
 	st.Parent = ring
 	ring.Parent = self.holder
@@ -1502,7 +1746,26 @@ end
 function UI:Step(dt)
 	self.t = self.t + dt
 	local t = self.t
-	local half = self.half
+	local half, scale = self.half, self.scale
+
+	-- smooth dragging: the button eases toward your finger instead of snapping to it
+	if self.targetPos then
+		local a = 1 - math.exp(-dt * 26)
+		self.pos = self.pos:Lerp(self.targetPos, a)
+		if not self.dragging and (self.targetPos - self.pos).Magnitude < 0.05 then
+			self.pos = self.targetPos
+			self.targetPos = nil
+		end
+		self.holder.Position = UDim2.fromOffset(self.pos.X, self.pos.Y)
+	end
+	local sc = self.uiScale.Scale
+	if sc ~= self.scaleTarget then
+		sc = sc + (self.scaleTarget - sc) * (1 - math.exp(-dt * 16))
+		if math.abs(sc - self.scaleTarget) < 0.002 then
+			sc = self.scaleTarget
+		end
+		self.uiScale.Scale = sc
+	end
 
 	if self.blend ~= self.target then
 		local step = dt / 0.35
@@ -1524,12 +1787,23 @@ function UI:Step(dt)
 
 	self.web.Rotation = (t * (6 + 14 * self.blend)) % 360
 
-	for _, c in ipairs(self.crawlers) do
-		local gait = 0.35 + 0.65 * math.abs(math.sin(t * c.rate + c.phase)) -- stop-and-go crawl
-		c.angle = c.angle + c.dir * c.speed * gait * dt * (1 + 0.8 * self.blend)
-		local r = half + 1 + math.sin(t * 5 + c.phase * 2) * 1.8
+	-- spiders: run around the rim in stop-and-go bursts, legs moving as they go
+	self.legClock = self.legClock + dt
+	local poseNow = self.legClock >= (1 / 30)
+	if poseNow then
+		self.legClock = 0
+	end
+	for _, c in ipairs(self.spiders) do
+		local gait = 0.35 + 0.65 * math.abs(math.sin(t * c.rate + c.phase))
+		local boost = 1 + 0.8 * self.blend
+		c.angle = c.angle + c.dir * c.speed * gait * dt * boost
+		c.step = c.step + gait * c.speed * dt * 14 * boost
+		local r = half + scale + math.sin(t * 5 + c.phase * 2) * 1.2 * scale
 		c.frame.Position = UDim2.fromOffset(half + math.cos(c.angle) * r, half + math.sin(c.angle) * r)
-		c.frame.Rotation = math.deg(c.angle) + 90 + math.sin(t * 9 + c.phase) * 14
+		c.frame.Rotation = math.deg(c.angle) + ((c.dir > 0) and 180 or 0) + math.sin(t * 9 + c.phase) * 6
+		if poseNow then
+			poseSpider(c.spider, c.step, 18)
+		end
 	end
 
 	if self.grow > 0 or self.legsShown then
